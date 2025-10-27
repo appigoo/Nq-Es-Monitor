@@ -1,25 +1,17 @@
 """
-Streamlit app: Futu NQ & ES 期货实时监控面板
-------------------------------------------------
-将原先的命令列脚本改造成可以在 Streamlit 上运行的交互式仪表盘。
+Streamlit app: Futu NQ & ES 期货实时监控面板（修正版）
+----------------------------------------------------
+已修復 f-string 未終止造成的 SyntaxError，並整理錯誤處理與說明。
 
-功能要点：
-- 支持 FutuOpenD (优先) 与 yfinance (回退) 抓取 NQ/ES 主连报价
-- 可设定轮询间隔、阈值（涨/跌）、是否记录 CSV
-- 即时显示当前价格、相对前收百分比、聚合情绪信号（RISK ON / NEUTRAL / RISK OFF）
-- 绘制时间序列图、显示最近 N 次记录的表格并可下载 CSV
-
-运行说明：
-1) 安装依赖：
+使用步驟：
+1) 安裝依賴：
    pip install streamlit futu yfinance pandas
-   （若不使用 Futu，可省掉 futu；若使用 Futu，请先启动 FutuOpenD）
-2) 将本文件保存为 futu_streamlit_monitor.py
-3) 运行：
+   （若不使用 Futu，可不安裝 futu；若使用 Futu，請先啟動 FutuOpenD）
+2) 將此檔另存為 futu_streamlit_monitor.py
+3) 執行：
    streamlit run futu_streamlit_monitor.py
 
-注意事项：
-- 请在富途客户端确认你在使用的期货合约代码，例如 'NQmain.US'、'ESmain.US'，并在界面中修改对应符号。
-- 本工具仅作监控示例，不构成投资建议。
+備註：Streamlit 會在非標準執行環境顯示 “missing ScriptRunContext” 的警告，這通常可忽略。
 
 """
 
@@ -44,7 +36,7 @@ except Exception:
 
 st.set_page_config(page_title='NQ & ES Monitor (Futu/YF)', layout='wide')
 
-st.title('NQ & ES 期货实时监控（Streamlit）')
+st.title('NQ & ES 期货实时监控（Streamlit） — 修正版')
 
 # Sidebar controls
 st.sidebar.header('设置')
@@ -60,10 +52,11 @@ ES_symbol = st.sidebar.text_input('ES (示例)', value='ESmain.US')
 
 st.sidebar.markdown('---')
 st.sidebar.subheader('阈值（百分比）')
-th_up = st.sidebar.number_input('上涨阈值（%）', value=0.3, step=0.1)
-th_down = st.sidebar.number_input('下跌阈值（%）', value=-0.3, step=0.1)
-th_up = th_up / 100.0
-th_down = th_down / 100.0
+th_up_pct = st.sidebar.number_input('上涨阈值（%）', value=0.3, step=0.1)
+th_down_pct = st.sidebar.number_input('下跌阈值（%）', value=0.3, step=0.1)
+# Note: store as positive numbers in UI; convert to decimals and negative for down
+th_up = th_up_pct / 100.0
+th_down = -abs(th_down_pct / 100.0)
 
 # Storage for session
 if 'df' not in st.session_state:
@@ -93,7 +86,10 @@ def get_prices_futu(oqc, symbols):
                 row = data.iloc[0]
                 last_price = row.get('last_price', None)
                 prev_close = row.get('last_close', None) or row.get('prev_close', None)
-                results[name] = (float(last_price), float(prev_close) if prev_close is not None else None)
+                # Ensure numeric or None
+                last_price = float(last_price) if last_price is not None else None
+                prev_close = float(prev_close) if prev_close is not None else None
+                results[name] = (last_price, prev_close)
             else:
                 results[name] = (None, None)
         except Exception:
@@ -106,7 +102,8 @@ def get_prices_yf(tickers):
     for name, ticker in tickers.items():
         try:
             t = yf.Ticker(ticker)
-            info = t.fast_info
+            # fast_info may vary by yfinance version; use history fallback
+            info = getattr(t, 'fast_info', {}) or {}
             last = info.get('last_price') or info.get('last_close') or info.get('regular_market_price')
             prev = info.get('previous_close') or info.get('last_close')
             if last is None:
@@ -114,7 +111,9 @@ def get_prices_yf(tickers):
                 if not hist.empty:
                     last = hist['Close'].iloc[-1]
                     prev = hist['Close'].iloc[-1]
-            results[name] = (float(last), float(prev) if prev is not None else None)
+            last_price = float(last) if last is not None else None
+            prev_close = float(prev) if prev is not None else None
+            results[name] = (last_price, prev_close)
         except Exception:
             results[name] = (None, None)
     return results
@@ -146,10 +145,9 @@ if stop:
 if clear:
     st.session_state.df = st.session_state.df.iloc[0:0]
 
-# Main loop runner (non-blocking by leveraging st.button and rerun)
+# Main loop runner
 if st.session_state.running:
     try:
-        # Try connect to futu if requested
         oqc = None
         if use_futu and FUTU_AVAILABLE:
             try:
@@ -160,7 +158,6 @@ if st.session_state.running:
         symbols = {'NQ': NQ_symbol, 'ES': ES_symbol}
         yf_symbols = {'NQ': 'NQ=F', 'ES': 'ES=F'}
 
-        prices = None
         if oqc is not None:
             prices = get_prices_futu(oqc, symbols)
         else:
@@ -182,10 +179,14 @@ if st.session_state.running:
             'ES_price': prices['ES'][0], 'ES_prev': prices['ES'][1], 'ES_pct': pcts['ES'],
             'signal': signal, 'note': note
         }
-        st.session_state.df = pd.concat([pd.DataFrame([row]), st.session_state.df], ignore_index=True).head(5000)
 
-        status_placeholder.markdown(f"**Last update (UTC):** {now}  
-**Signal:** {signal} — {note}")
+        # Prepend to dataframe (keep recent first)
+        df_new = pd.DataFrame([row])
+        st.session_state.df = pd.concat([df_new, st.session_state.df], ignore_index=True).head(5000)
+
+        # Update UI
+        status_text = f"Last update (UTC): {now}  \nSignal: {signal} — {note}"
+        status_placeholder.markdown(status_text)
         table_placeholder.dataframe(st.session_state.df.rename(columns=lambda c: c.replace('_',' ')), height=420)
 
         # Charts
@@ -200,14 +201,13 @@ if st.session_state.running:
         st.session_state.df.to_csv(csv_buf, index=False)
         st.download_button('下載 CSV（含紀錄）', csv_buf.getvalue(), file_name='futu_nq_es_log.csv')
 
-        # Close futu connection
         if oqc is not None:
             try:
                 oqc.close()
             except Exception:
                 pass
 
-        # sleep then rerun (use st.experimental_rerun pattern)
+        # Sleep then rerun
         time.sleep(interval)
         st.experimental_rerun()
 
